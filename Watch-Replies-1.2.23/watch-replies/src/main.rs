@@ -1,0 +1,626 @@
+#![cfg_attr(any(target_os = "none", wp2_sim), no_main, cfg_attr(target_os = "none", no_std))]
+
+//! Watch Replies: the messages that come to the phone (WhatsApp, Messenger, Telegram), as cards on the watch, and a
+//! keyboard to answer them. The phone side is the Watch Menu app. Protocol: `proto.rs`.
+
+mod font;
+mod arabic;
+mod gesture;
+#[rustfmt::skip]
+mod fonts;
+mod fonts_small;
+mod icons;
+mod keys;
+mod proto;
+mod view;
+mod words;
+
+pub use cmf_wp2_ui::{C, SIZE};
+
+#[cfg(not(any(target_os = "none", wp2_sim)))]
+fn main() {}
+
+#[cfg(any(target_os = "none", wp2_sim))]
+mod device {
+    use crate::gesture::{Gesture, classify};
+    use crate::keys::{self, Cell, Key, Page};
+    use crate::proto::{self, Effect, Model, REPLY_MAX};
+    use crate::view;
+    use cmf_wp2_app::{Api, BUTTON, CROWN, MSG_MAX, PAUSE, RESUME, TOUCH_DOWN, TOUCH_UP};
+
+    cmf_wp2_app::entry!(main);
+    cmf_wp2_app::app_icon!();
+
+    /// Say hello to the phone again this often while it has not answered (doubling up to a minute).
+    const HELLO_MS: u32 = 3000;
+    /// A reply that the phone does not answer in this long has failed.
+    const SEND_MS: u32 = 15000;
+    /// "Sent" stays this long, "Not sent" a little longer.
+    const SENT_MS: u32 = 1400;
+    const FAILED_MS: u32 = 2600;
+    /// How long after a reply the phone may send it back as a message (its own echo).
+    const ECHO_MS: u32 = 8000;
+    /// Tell the phone which conversation is open; the phone expires this focus if heartbeats stop.
+    const FOCUS_MS: u32 = 2500;
+    const GAP_MS: u32 = 20;
+    const FRAME_MS: u32 = 16;
+
+    static mut MODEL: Model = Model::new();
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Screen {
+        Inbox,
+        Detail,
+        Keyboard,
+        Sending,
+        Sent,
+        Failed,
+    }
+
+    /// What a finger came down on in the keyboard.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Target {
+        Key(Cell),
+        Chip(usize),
+        Send,
+    }
+
+    // true on RESUME, false on BUTTON
+    fn paused(api: &Api) -> bool {
+        loop {
+            match api.event(u32::MAX).map(|e| e.kind) {
+                Some(RESUME) => return true,
+                Some(BUTTON) => return false,
+                _ => {}
+            }
+        }
+    }
+
+    struct Draft {
+        text: [u8; REPLY_MAX],
+        len: usize,
+        to: [u8; 40],
+        to_len: usize,
+        chat: u8,
+        page: Page,
+        shift: bool,
+    }
+
+    impl Draft {
+        fn bytes(&self) -> &[u8] {
+            &self.text[..self.len]
+        }
+
+        /// Replaces the empty draft with a completed speech-recognition result, preserving UTF-8.
+        fn replace(&mut self, input: &[u8]) {
+            let cap = input.len().min(REPLY_MAX);
+            let n = (0..=cap).rev().find(|&i| core::str::from_utf8(&input[..i]).is_ok()).unwrap_or(0);
+            self.text[..n].copy_from_slice(&input[..n]);
+            self.len = n;
+        }
+
+        fn to(&self) -> &str {
+            core::str::from_utf8(&self.to[..self.to_len]).unwrap_or("")
+        }
+
+        /// Starts a reply to `c`.
+        fn open(&mut self, c: &proto::Chat) {
+            let b = c.name();
+            let mut n = 0;
+            let take = b.len().min(self.to.len());
+            // not in the middle of a letter
+            let take = (0..=take).rev().find(|&i| b.is_char_boundary(i)).unwrap_or(0);
+            self.to[n..n + take].copy_from_slice(&b.as_bytes()[..take]);
+            n += take;
+            let page = if self.page.is_arabic() { Page::ArabicLetters } else { Page::Letters };
+            (self.to_len, self.chat, self.len, self.page, self.shift) = (n, c.id, 0, page, page == Page::Letters);
+        }
+
+        /// Appends one complete Unicode character; never leaves a partial UTF-8 sequence in the draft.
+        fn push(&mut self, code: u8) -> bool {
+            let ch = keys::character(code);
+            let mut encoded = [0u8; 4];
+            let bytes = ch.encode_utf8(&mut encoded).as_bytes();
+            if self.len + bytes.len() > REPLY_MAX {
+                return false;
+            }
+            self.text[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+            true
+        }
+
+        /// Removes the last complete UTF-8 character, not merely its final byte.
+        fn backspace(&mut self) {
+            if self.len == 0 { return; }
+            let mut start = self.len - 1;
+            while start > 0 && (self.text[start] & 0xC0) == 0x80 { start -= 1; }
+            self.len = start;
+        }
+    }
+
+    fn main(api: &'static Api) -> i32 {
+        // SAFETY: the app has one thread and this is the only reference.
+        let m = unsafe { &mut *core::ptr::addr_of_mut!(MODEL) };
+        m.set_defaults();
+        api.own_back(true); // a right swipe or the crown press is "back" here: keyboard -> messages -> leave
+        let mut d = Draft { text: [0; REPLY_MAX], len: 0, to: [0; 40], to_len: 0, chat: 0, page: Page::Letters, shift: true };
+        let mut screen = Screen::Inbox;
+        let mut top = 0usize;
+        let mut dirty = true;
+        let mut drawn_end = 0u32;
+        let mut hello_at: Option<u32> = None;
+        let mut tries = 0u32;
+        let mut touch0: Option<(u32, i32, i32)> = None;
+        let mut card_down: Option<usize> = None;
+        let mut det_chat = 0u8; // the chat on the full-message screen
+        let mut dscroll = 0usize; // target scroll in pixels
+        let mut dscroll_anim = 0usize; // currently rendered scroll position
+        let mut dscroll_max = 0usize; // cached content height; do not re-measure every animation frame
+        let mut frame_at = 0u32; // when the last glide frame was drawn
+        let mut rep_down = false;
+        let mut voice_listening = false;
+        let mut voice_error = false;
+        let mut voice_parts = [0u8; REPLY_MAX];
+        let mut voice_len = 0usize;
+        let mut voice_next = 0u8;
+        let mut target: Option<Target> = None;
+        let mut until: Option<u32> = None; // when a status page ends (Sent, Failed) or a reply times out (Sending)
+        let mut keep_on = false;
+        let mut echo_at = 0u32;
+        let mut focus_at = api.now().wrapping_sub(FOCUS_MS);
+        let mut last_focus_chat: Option<u8> = None;
+        loop {
+            let now = api.now();
+            let focused_chat = if matches!(screen, Screen::Detail | Screen::Keyboard | Screen::Sending | Screen::Sent | Screen::Failed) { det_chat } else { 0 };
+            if last_focus_chat != Some(focused_chat) || now.wrapping_sub(focus_at) >= FOCUS_MS {
+                let _ = api.send(&proto::focus(focused_chat));
+                last_focus_chat = Some(focused_chat);
+                focus_at = now;
+            }
+            if !m.heard && hello_at.is_none_or(|t| now.wrapping_sub(t) >= (HELLO_MS << tries.min(4)).min(60_000)) {
+                api.send(&proto::hello()); // -107 while the phone is not listening: asked again
+                hello_at = Some(now);
+                tries += 1;
+            }
+            let on = matches!(screen, Screen::Keyboard | Screen::Sending);
+            if on != keep_on {
+                keep_on = on;
+                api.keep_screen_on(on);
+            }
+            if let Some(t) = until.filter(|&t| now.wrapping_sub(t) as i32 >= 0) {
+                until = None;
+                let _ = t;
+                match screen {
+                    Screen::Sending => {
+                        screen = Screen::Failed;
+                        until = Some(now.wrapping_add(FAILED_MS));
+                    }
+                    Screen::Sent => screen = Screen::Inbox,
+                    Screen::Failed => screen = Screen::Keyboard,
+                    _ => {}
+                }
+                dirty = true;
+            }
+            let cadence = if screen == Screen::Detail { FRAME_MS } else { GAP_MS };
+            if dirty && now.wrapping_sub(drawn_end) >= cadence {
+                let mut s = api;
+                match screen {
+                    Screen::Inbox => {
+                        top = top.min(view::max_top(m.n));
+                        if m.n == 0 {
+                            view::idle(&mut s, m.heard);
+                        } else {
+                            view::page(&mut s, &m.chats[top], top, m.n, card_down.is_some());
+                        }
+                    }
+                    Screen::Detail => match m.find(det_chat) {
+                        Some(i) => {
+                            dscroll = dscroll.min(dscroll_max);
+                            dscroll_anim = dscroll_anim.min(dscroll_max);
+                            let diff = dscroll as i32 - dscroll_anim as i32;
+                            if diff != 0 {
+                                // the glide takes the same time however long a frame takes to draw: a slow frame moves further
+                                let dt = now.wrapping_sub(frame_at).clamp(10, 48) as i32;
+                                // Keep the same ease-out glide, but settle sooner and cap missed-frame jumps.
+                                let step = if diff.abs() <= 2 { diff } else { diff * dt / (dt + 34) };
+                                let step = if step == 0 { diff.signum() } else { step };
+                                dscroll_anim = (dscroll_anim as i32 + step) as usize;
+                            }
+                            frame_at = now;
+                            view::detail(&mut s, &m.chats[i], dscroll_anim, rep_down);
+                        }
+                        None => screen = Screen::Inbox, // the chat is gone: drawn as the inbox on the next round
+                    },
+                    Screen::Keyboard => view::keyboard_voice(&mut s, m, d.to(), d.bytes(), d.page, d.shift, voice_listening, voice_error),
+                    Screen::Sending => view::status(&mut s, 0, "Sending…", ""),
+                    Screen::Sent => view::status(&mut s, 1, "Sent", d.to()),
+                    Screen::Failed => view::status(&mut s, 2, "Not sent", "Is Watch Menu open?"),
+                }
+                api.show();
+                let animate = screen == Screen::Detail && dscroll_anim != dscroll;
+                (dirty, drawn_end) = (animate, api.now());
+                continue;
+            }
+            let mut wait = if dirty { cadence.saturating_sub(now.wrapping_sub(drawn_end)).max(1) } else { 1000 };
+            if let Some(t) = until {
+                wait = wait.min((t.wrapping_sub(now) as i32).max(1) as u32);
+            }
+            if !m.heard {
+                wait = wait.min(500);
+            }
+            let mut ev = api.event(wait);
+            while let Some(e) = ev {
+                match e {
+                    e if e.kind == BUTTON => match screen {
+                        Screen::Inbox => { let _ = api.send(&proto::close_focus()); return 0; },
+                        Screen::Keyboard => {
+                            if voice_listening {
+                                let _ = api.send(&proto::dictation_toggle(d.page.is_arabic()));
+                                voice_listening = false;
+                            }
+                            voice_error = false;
+                            (screen, until, dirty) = (if m.find(det_chat).is_some() { Screen::Detail } else { Screen::Inbox }, None, true);
+                            target = None;
+                        }
+                        Screen::Sending => {
+                            (screen, until, dirty) = (if m.find(det_chat).is_some() { Screen::Detail } else { Screen::Inbox }, None, true);
+                            target = None;
+                        }
+                        _ => (screen, until, dirty) = (Screen::Inbox, None, true),
+                    },
+                    e if e.kind == CROWN && screen == Screen::Detail => {
+                        if let Some(i) = m.find(det_chat) {
+                            let max = dscroll_max;
+                            let amount = (e.delta.unsigned_abs() as usize).clamp(1, 3) * 30;
+                            let next = if e.delta > 0 { (dscroll + amount).min(max) } else { dscroll.saturating_sub(amount) };
+                            if next != dscroll {
+                                (dscroll, dirty) = (next, true);
+                            }
+                        }
+                    }
+                    e if e.kind == CROWN && screen == Screen::Inbox => {
+                        let next = if e.delta > 0 { top + 1 } else { top.saturating_sub(1) };
+                        let next = next.min(view::max_top(m.n));
+                        if next != top {
+                            (top, dirty) = (next, true);
+                        }
+                    }
+                    e if e.kind == TOUCH_DOWN => {
+                        touch0 = Some((api.now(), e.x as i32, e.y as i32));
+                        let (x, y) = (e.x as i32, e.y as i32);
+                        match screen {
+                            Screen::Inbox => {
+                                card_down = (m.n > 0 && view::page_at(x, y)).then_some(top);
+                                dirty |= card_down.is_some();
+                            }
+                            Screen::Detail => {
+                                rep_down = view::reply_at(x, y);
+                                dirty |= rep_down;
+                            }
+                            Screen::Keyboard => {
+                                target = if view::send_at(x, y) {
+                                    Some(Target::Send)
+                                } else if view::chip_at(&m.items(d.bytes()).0[..m.items(d.bytes()).1], x, y).is_some() {
+                                    view::chip_at(&m.items(d.bytes()).0[..m.items(d.bytes()).1], x, y).map(Target::Chip)
+                                } else {
+                                    keys::key_at(d.page, x, y).map(Target::Key)
+                                };
+                                if let Some(Target::Key(c)) = target {
+                                    let mut s = api;
+                                    view::key(&mut s, &c, d.page, d.shift, true);
+                                    api.show();
+                                    drawn_end = api.now();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    e if e.kind == TOUCH_UP => {
+                        let Some((t, x0, y0)) = touch0.take() else {
+                            ev = api.event(0);
+                            continue;
+                        };
+                        let (x, y) = (e.x as i32, e.y as i32);
+                        let held = api.now().wrapping_sub(t);
+                        match screen {
+                            Screen::Inbox => {
+                                let down = card_down.take();
+                                dirty |= down.is_some();
+                                match classify(x - x0, y - y0, held) {
+                                    Gesture::SwipeUp => {
+                                        top = (top + 1).min(view::max_top(m.n));
+                                        dirty = true;
+                                    }
+                                    Gesture::SwipeDown => {
+                                        top = top.saturating_sub(1);
+                                        dirty = true;
+                                    }
+                                    Gesture::Tap | Gesture::Hold => {
+                                        if let Some(i) = down.filter(|&i| i < m.n && view::page_at(x, y)) {
+                                            // the whole message first; reply is on that screen
+                                            (det_chat, dscroll_max) = (m.chats[i].id, view::detail_max(&m.chats[i]));
+                                            dscroll = dscroll_max;
+                                            dscroll_anim = dscroll;
+                                            (screen, dirty) = (Screen::Detail, true);
+                                        }
+                                    }
+                                    Gesture::None => {}
+                                }
+                            }
+                            Screen::Detail => {
+                                let down = core::mem::take(&mut rep_down);
+                                dirty |= down;
+                                let max = dscroll_max;
+                                match classify(x - x0, y - y0, held) {
+                                    Gesture::SwipeUp => {
+                                        // Scroll by the actual finger travel, not a fixed 96 px jump.
+                                        let distance = (y0 - y).abs().clamp(36, 160) as usize;
+                                        dscroll = (dscroll + distance).min(max);
+                                        frame_at = api.now();
+                                        dirty = true;
+                                    }
+                                    Gesture::SwipeDown => {
+                                        let distance = (y0 - y).abs().clamp(36, 160) as usize;
+                                        dscroll = dscroll.saturating_sub(distance);
+                                        frame_at = api.now();
+                                        dirty = true;
+                                    }
+                                    Gesture::Tap | Gesture::Hold => {
+                                        if let (true, true, Some(i)) = (down, view::reply_at(x, y), m.find(det_chat)) {
+                                            d.open(&m.chats[i]);
+                                            (screen, dirty) = (Screen::Keyboard, true);
+                                        }
+                                    }
+                                    Gesture::None => {}
+                                }
+                            }
+                            Screen::Keyboard => {
+                                let down = target.take();
+                                // the key is drawn as it was, whatever the touch did
+                                if let Some(Target::Key(c)) = down {
+                                    let mut s = api;
+                                    view::key(&mut s, &c, d.page, d.shift, false);
+                                    api.show();
+                                    drawn_end = api.now();
+                                }
+                                let same = match down {
+                                    Some(Target::Key(c)) => keys::key_at(d.page, x, y).is_some_and(|u| u.key == c.key),
+                                    Some(Target::Chip(i)) => view::chip_at(&m.items(d.bytes()).0[..m.items(d.bytes()).1], x, y) == Some(i),
+                                    Some(Target::Send) => view::send_at(x, y),
+                                    None => false,
+                                };
+                                if !same {
+                                    ev = api.event(0);
+                                    continue;
+                                }
+                                let mut changed = false;
+                                match down {
+                                    Some(Target::Key(c)) => match c.key {
+                                        Key::Ch(_) => {
+                                            if let Some(ch) = keys::typed(c.key, d.shift && d.page == Page::Letters) {
+                                                changed = d.push(ch);
+                                            }
+                                            let shift = d.page == Page::Letters && keys::sentence_start(d.bytes());
+                                            if shift != d.shift {
+                                                d.shift = shift;
+                                                let mut s = api;
+                                                view::all_keys(&mut s, d.page, d.shift);
+                                            }
+                                        }
+                                        Key::Space => {
+                                            if held >= crate::gesture::HOLD_MS {
+                                                // Hold Space: switch English <-> Arabic without inserting a space.
+                                                d.page = d.page.toggle_language();
+                                                d.shift = d.page == Page::Letters && keys::sentence_start(d.bytes());
+                                                let mut s = api;
+                                                view::keyboard_voice(&mut s, m, d.to(), d.bytes(), d.page, d.shift, voice_listening, voice_error);
+                                                api.show();
+                                                drawn_end = api.now();
+                                            } else {
+                                                // Tap Space: insert a normal space.
+                                                changed = d.push(b' ');
+                                                let shift = d.page == Page::Letters && keys::sentence_start(d.bytes());
+                                                if shift != d.shift {
+                                                    d.shift = shift;
+                                                    let mut s = api;
+                                                    view::all_keys(&mut s, d.page, d.shift);
+                                                }
+                                            }
+                                        }
+                                        Key::Back => {
+                                            if held >= crate::gesture::HOLD_MS {
+                                                d.len = 0; // holding backspace clears the lot
+                                            } else {
+                                                d.backspace();
+                                            }
+                                            changed = true;
+                                            let shift = d.page == Page::Letters && keys::sentence_start(d.bytes());
+                                            if shift != d.shift {
+                                                d.shift = shift;
+                                                let mut s = api;
+                                                view::all_keys(&mut s, d.page, d.shift);
+                                            }
+                                        }
+                                        Key::Shift => {
+                                            d.shift = !d.shift;
+                                            let mut s = api;
+                                            view::all_keys(&mut s, d.page, d.shift);
+                                            api.show();
+                                        }
+                                        Key::Page => {
+                                            d.page = d.page.toggle_numbers();
+                                            d.shift = d.page == Page::Letters && keys::sentence_start(d.bytes());
+                                            let mut s = api;
+                                            view::keyboard_voice(&mut s, m, d.to(), d.bytes(), d.page, d.shift, voice_listening, voice_error);
+                                            api.show();
+                                        }
+                                    },
+                                    Some(Target::Chip(i)) => {
+                                        if d.len == 0 {
+                                            let q = m.quick(i).as_bytes();
+                                            let n = q.len().min(REPLY_MAX);
+                                            d.text[..n].copy_from_slice(&q[..n]);
+                                            d.len = n;
+                                        } else {
+                                            // finish the word being typed, and a space after it
+                                            let (items, _) = m.items(d.bytes());
+                                            let w = items[i].as_bytes();
+                                            let fl = crate::words::fragment(d.bytes()).len();
+                                            let cap = d.bytes()[d.len - fl..].first().is_some_and(|b| b.is_ascii_uppercase());
+                                            if d.len - fl + w.len() + 1 <= REPLY_MAX {
+                                                d.len -= fl;
+                                                for (k, &b) in w.iter().enumerate() {
+                                                    d.text[d.len] = if k == 0 && cap { b.to_ascii_uppercase() } else { b };
+                                                    d.len += 1;
+                                                }
+                                                d.text[d.len] = b' ';
+                                                d.len += 1;
+                                            }
+                                        }
+                                        changed = true;
+                                        d.shift = false;
+                                        dirty = true; // the keys change case too
+                                    }
+                                    Some(Target::Send) if d.len == 0 => {
+                                        let was_listening = voice_listening;
+                                        if api.send(&proto::dictation_toggle(d.page.is_arabic())) >= 0 {
+                                            voice_error = false;
+                                            if !was_listening { voice_listening = true; }
+                                        } else {
+                                            voice_listening = false;
+                                            voice_error = true;
+                                        }
+                                        dirty = true;
+                                    }
+                                    Some(Target::Send) if d.len > 0 => {
+                                        let mut buf = [0u8; MSG_MAX];
+                                        let mut ok = true;
+                                        for i in 0..proto::pieces(d.len) {
+                                            let n = proto::reply_piece(d.chat, d.bytes(), i, &mut buf);
+                                            ok &= api.send(&buf[..n]) >= 0;
+                                        }
+                                        if ok {
+                                            m.arm_echo(d.chat, d.bytes());
+                                            echo_at = api.now();
+                                            (screen, until) = (Screen::Sending, Some(api.now().wrapping_add(SEND_MS)));
+                                        } else {
+                                            (screen, until) = (Screen::Failed, Some(api.now().wrapping_add(FAILED_MS)));
+                                        }
+                                        dirty = true;
+                                    }
+                                    _ => {}
+                                }
+                                if changed && !dirty {
+                                    let mut s = api;
+                                    view::text_changed_voice(&mut s, m, d.to(), d.bytes(), voice_listening, voice_error);
+                                    api.show();
+                                    drawn_end = api.now();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    e if e.kind == PAUSE => {
+                        (touch0, card_down, target, rep_down) = (None, None, None, false);
+                        if voice_listening {
+                            let _ = api.send(&proto::dictation_toggle(d.page.is_arabic()));
+                            voice_listening = false;
+                        }
+                        if !paused(api) {
+                            return 0;
+                        }
+                        // messages were refused meanwhile: ask for everything again
+                        (m.heard, hello_at, tries, dirty) = (false, None, 0, true);
+                    }
+                    _ => {}
+                }
+                ev = api.event(0);
+            }
+            let mut buf = [0u8; MSG_MAX];
+            while let Some(msg) = api.recv(&mut buf) {
+                // Voice state and text are small r1 protocol messages, separate from chat updates.
+                if msg.len() >= 4 && msg.starts_with(b"r1S") {
+                    voice_listening = msg[3] == 1;
+                    voice_error = msg[3] == 2;
+                    dirty |= screen == Screen::Keyboard;
+                    tries = 0;
+                    continue;
+                }
+                if msg.len() >= 4 && msg.starts_with(b"r1T") {
+                    if screen == Screen::Keyboard {
+                        let flags = msg[3];
+                        let index = flags & 15;
+                        if index == 0 { voice_len = 0; voice_next = 0; }
+                        let part = &msg[4..];
+                        if index == voice_next && voice_len + part.len() <= REPLY_MAX {
+                            voice_parts[voice_len..voice_len + part.len()].copy_from_slice(part);
+                            voice_len += part.len();
+                            voice_next = voice_next.wrapping_add(1);
+                            if flags & 0x80 != 0 {
+                                d.replace(&voice_parts[..voice_len]);
+                                d.shift = d.page == Page::Letters && keys::sentence_start(d.bytes());
+                                voice_listening = false;
+                                voice_error = false;
+                                voice_len = 0;
+                                voice_next = 0;
+                                dirty = true;
+                            }
+                        } else {
+                            voice_len = 0;
+                            voice_next = 0;
+                            voice_listening = false;
+                            voice_error = true;
+                            dirty = true;
+                        }
+                    }
+                    tries = 0;
+                    continue;
+                }
+                if api.now().wrapping_sub(echo_at) >= ECHO_MS {
+                    m.disarm_echo();
+                }
+                let following_latest = screen == Screen::Detail && dscroll.saturating_add(16) >= dscroll_max;
+            match m.apply(msg) {
+                    Effect::Ignored => {}
+                    Effect::Changed => {
+                        // the keyboard is not redrawn under the person's fingers, except for its quick replies
+                        if screen == Screen::Inbox || screen == Screen::Detail {
+                            dirty = true;
+                        }
+                        // A new message for the selected chat follows the latest message.
+                        // Messages arriving for other chats do not move the conversation being read.
+                        if (screen == Screen::Detail || screen == Screen::Keyboard) && msg.len() >= 4 && (msg[2] == b'L' || msg[2] == b'U') && msg[3] == det_chat {
+                            if let Some(i) = m.find(det_chat) {
+                                dscroll_max = view::detail_max(&m.chats[i]);
+                                if screen == Screen::Keyboard || following_latest { dscroll = dscroll_max; }
+                                else { dscroll = dscroll.min(dscroll_max); }
+                            }
+                        }
+                    }
+                    Effect::Result(id, status) => {
+                        if screen == Screen::Sending && id == d.chat {
+                            if status == 0 {
+                                m.sent(id, d.bytes());
+                                if let Some(i) = m.find(det_chat) {
+                                    dscroll_max = view::detail_max(&m.chats[i]);
+                                    dscroll = dscroll_max;
+                                    (screen, until) = (Screen::Detail, None);
+                                } else {
+                                    (screen, until) = (Screen::Inbox, None);
+                                }
+                            } else {
+                                m.disarm_echo();
+                                (screen, until) = (Screen::Failed, Some(api.now().wrapping_add(FAILED_MS)));
+                            }
+                            dirty = true;
+                        }
+                    }
+                }
+                if m.heard && screen == Screen::Inbox && m.n == 0 {
+                    dirty = true;
+                }
+                tries = 0;
+            }
+        }
+    }
+}
